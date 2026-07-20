@@ -1,0 +1,299 @@
+# 光遇自动化在线转换系统 - 搭建文档（单机版）
+
+## 架构概览
+
+整个系统由 **两个网站（站点）** 配合 **云机端脚本** 组成：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    云机（Android模拟器）                      │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  光遇（改包版） + GameGuardian + 转换在线.lua          │  │
+│  └──────────────┬────────────────────────────────────────┘  │
+│                 │ HTTP 请求                                  │
+└─────────────────┼───────────────────────────────────────────┘
+                  │
+    ┌─────────────┴─────────────┐
+    │                           │
+    ▼                           ▼
+┌─────────────────┐   ┌───────────────────┐
+│  站点一          │   │  站点二            │
+│  提交在线 PHP    │   │  Nginx 反向代理    │
+│  (接口层)       │   │  (登录劫持层)      │
+│  域名: api.xxx  │   │  域名: proxy.xxx   │
+│  端口: 443      │   │  端口: 443         │
+└────────┬────────┘   └────────┬──────────┘
+         │                     │
+         │ 读/写 db.json       │ 劫持 login 请求
+         │                     │ 读取 db.json 注入凭证
+         ▼                     ▼
+    ┌─────────────────────────────────┐
+    │       光遇官方服务器             │
+    │  https://live.radiance.         │
+    │  thatgamecompany.com            │
+    └─────────────────────────────────┘
+```
+
+---
+
+## 环境要求
+
+| 组件 | 版本 | 说明 |
+|------|------|------|
+| 宝塔面板 | 最新稳定版 | 服务器管理面板 |
+| PHP | 7.4 及以上 | **推荐 7.4+** |
+| Nginx | OpenResty | **必须**（需要 Lua 支持） |
+
+> ⚠️ 本系统已优化为**单机模式**，无需 MySQL / MariaDB，也无需 `v=x` 多机参数。
+
+---
+
+## 站点一：提交在线接口（API 层）
+
+### 1. 创建网站
+
+在宝塔面板中创建一个新网站：
+- **域名**：任意（如 `api.yourdomain.com`）
+- **PHP 版本**：选择 PHP-74
+- **创建后**：删除网站目录下的所有默认文件
+
+### 2. 上传文件
+
+将以下文件上传到网站根目录：
+
+| 文件 | 说明 |
+|------|------|
+| `config.php` | 配置文件，设置鉴权 Token |
+| `index.php` | 主程序（API 处理） |
+
+### 3. 配置 Token
+
+编辑 `config.php`，将 `改成自己的token` 替换为自定义的鉴权密钥：
+
+```php
+define('AUTH_TOKEN', '你的自定义token');
+```
+
+> 这个 Token 用于所有 API 请求的 `Authorization` 请求头验证，请使用足够强度的随机字符串。
+
+### 4. 设置伪静态
+
+在宝塔面板 → 网站设置 → **伪静态**，填入以下内容（或使用文件 `伪静态.txt` 的内容）：
+
+```nginx
+location / {
+    try_files $uri $uri/ /index.php?$query_string;
+}
+
+# 禁止直接访问数据库文件和配置文件
+location ~* ^/(db[\d]*\.json|config\.php)$ {
+    deny all;
+    return 403;
+}
+
+location ~ \.php$ {
+    include fastcgi_params;
+    fastcgi_pass unix:/run/php/php-fpm.sock;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    fastcgi_index index.php;
+}
+```
+
+> 注意：伪静态规则已包含对 `db.json` 的安全拦截，防止外部直接访问状态数据文件。
+
+### 5. SSL 证书（推荐）
+
+在宝塔面板中为网站申请 **Let's Encrypt 证书**，开启 HTTPS。
+> 如果不配置证书，可使用 HTTP，但反代站点必须 HTTPS（游戏端要求）。
+
+### 6. 初始化和测试接口
+
+#### 6.1 初始化状态（设置为 NoTask）
+
+```bash
+curl -X POST 'http://你的域名/update_status' \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: 你的token' \
+  -d '{"update_status":"NoTask"}'
+```
+
+#### 6.2 提交一个账号任务
+
+```bash
+curl -X POST 'http://你的域名/submit_task' \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: 你的token' \
+  -d '{"update_status":"NewTask","user":"你的user-uuid","session":"你的session-token"}'
+```
+
+> ⚠️ `user` 必须是 36 位的 UUID 格式（例如 `e5ac0294-d64a-445a-a04a-bc7cd283b8b0`），`session` 必须是 32 位十六进制字符串。不能随意编造，否则无法登录游戏。
+
+#### 6.3 接口说明
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/get_task_status` | POST | 查询当前任务状态（返回 `NewTask` / `Working` / `NoTask`） |
+| `/submit_task` | POST | 提交新的账号任务（状态必须为 `NoTask` 才能提交） |
+| `/update_status` | POST | 更新状态为 `Working` 或 `NoTask` |
+
+> **状态流转：** `NoTask` →（提交任务）→ `NewTask` →（云机开始工作）→ `Working` →（工作完成）→ `NoTask`
+
+---
+
+## 站点二：Nginx 反向代理（登录劫持层）
+
+### 1. 创建反向代理网站
+
+在宝塔面板中再创建一个新网站：
+- **域名**：任意（如 `proxy.yourdomain.com`）
+- **PHP 版本**：无需 PHP
+- **创建后**：进入网站设置 → **反向代理**
+
+### 2. 配置反向代理
+
+反向代理目标：
+```
+https://live.radiance.thatgamecompany.com
+```
+
+### 3. 替换配置文件
+
+将网站配置文件替换为 `nginx反向代理配置.txt` 的内容，**关键修改**：
+
+```nginx
+location ^~ / {
+    proxy_pass https://live.radiance.thatgamecompany.com;
+    proxy_set_header Host live.radiance.thatgamecompany.com;
+    # ... 其他代理配置 ...
+
+    # 处理 login 端点
+    if ($request_uri ~* "login") {
+        access_by_lua '
+            local cjson = require "cjson"
+            ngx.header.content_type = "application/json";
+            local file_path = "/www/wwwroot/你的域名/db.json"   # ← 改成站点一的实际路径
+            # ... Lua 逻辑 ...
+        ';
+    }
+    # ...
+}
+```
+
+**必须修改的地方：**
+
+将 `file_path` 中的 `你的域名` 替换为 **站点一（提交在线 PHP）的网站目录实际路径**。
+
+例如，如果站点一的网站目录是 `/www/wwwroot/api.yourdomain.com`，则：
+```lua
+local file_path = "/www/wwwroot/api.yourdomain.com/db.json"
+```
+
+### 4. 申请 SSL 证书
+
+反代站点**必须配置 SSL 证书**（HTTPS），因为游戏端强制要求 HTTPS 连接。在宝塔面板中申请 **Let's Encrypt 证书**。
+
+### 5. 验证
+
+反代配置完成后，游戏客户端的登录请求会到达该代理服务器，代理会劫持 `/login` 请求，从站点一的 `db.json` 中读取当前账号的 user 和 session，注入到登录响应中返回给游戏客户端。
+
+---
+
+## 云机端配置
+
+### 1. 修改光遇 APK
+
+从官方提取光遇安装包，用工具（如 APKTool、MT 管理器）修改 `dex` 文件：
+
+| 修改项 | 值 | 说明 |
+|--------|-----|------|
+| 游戏服务器 Host | 改为**站点二（反代）的域名** | 使游戏连接你的代理服务器 |
+
+将修改后的 APK 上传到云机安装。
+
+### 2. 安装 GG 修改器
+
+在云机上安装 **GameGuardian**（原版或美化版均可）。
+
+### 3. 修改并上传 Lua 脚本
+
+编辑 `转换在线.lua`，修改其中的占位符：
+
+| 原内容 | 修改为 |
+|--------|--------|
+| `https://你的在线提交域名/update_status?=x` | `https://站点一域名/update_status` |
+| `https://你的域名/get_task_status?v=x` | `https://站点一域名/get_task_status` |
+| `你的token` | 与 `config.php` 中设置的一致 |
+
+> ⚠️ 注意：原始 Lua 中 URL 参数 `?=x`（缺少参数名 `v`）的错误已修正，现在直接使用固定 URL 即可。
+>
+> 轮询间隔为 **2 秒**，平衡响应速度与服务器负载。
+
+示例修改后的关键部分：
+```lua
+UpdateStatus = function()
+    local response = gg.makeRequest(
+        "https://api.yourdomain.com/update_status",
+        {
+            ["Authorization"] = "你的token",
+            ["Content-Type"] = "application/json"
+        },
+        '{"update_status":"Working"}',
+        "POST"
+    )
+    return response and response.code == 200
+end,
+
+CheckTask = function()
+    local response = gg.makeRequest(
+        "https://api.yourdomain.com/get_task_status",
+        {
+            ["Authorization"] = "你的token",
+            ["Content-Type"] = "application/json"
+        },
+        "{}",
+        "POST"
+    )
+    -- ...
+end
+```
+
+### 4. 运行 Lua 脚本
+
+1. 将修改后的 `转换在线.lua` 上传到云机
+2. 打开 GG 修改器，加载该脚本
+3. 首次运行会提示**授权使用网络**，请允许
+4. 等待底部提示"脚本加载成功"
+5. 点击 GG 图标打开菜单，选择 **启动后台监控**
+   - 脚本每 2 秒轮询一次接口，平衡响应速度与服务器负载
+
+---
+
+## 完整工作流程
+
+```
+1. 外部程序（如易语言客户端）向 站点一 提交账号任务
+   → POST /submit_task  {"update_status":"NewTask", "user":"...", "session":"..."}
+
+2. 云机上的 Lua 脚本轮询查询任务状态
+   → POST /get_task_status  → 返回 {"status":"NewTask"}
+
+3. Lua 脚本将状态更新为 Working
+   → POST /update_status  {"update_status":"Working"}
+
+4. Lua 脚本等待游戏重新登录
+   → 游戏向 站点二（反代）发起 login 请求
+   → 反代从 站点一 的 db.json 读取 user/session
+   → 返回伪造的登录响应给游戏
+
+5. 游戏登录成功后，Lua 脚本将状态设为 NoTask
+   → POST /update_status  {"update_status":"NoTask"}
+```
+
+---
+
+## 注意事项
+
+1. **user 和 session** 必须真实有效，不能随意编造，否则无法进入游戏
+2. **反代必须 HTTPS**，因为光遇客户端强制要求 HTTPS 连接
+3. **db.json 安全**：伪静态规则已拦截直接访问，但建议定期检查文件权限
+4. **单机模式**：本版本已简化为单机模式，每台云机独立配合使用，不再需要多机参数

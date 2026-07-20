@@ -1,0 +1,55 @@
+location ^~ / {
+    proxy_pass https://live.radiance.thatgamecompany.com;
+    proxy_set_header Host live.radiance.thatgamecompany.com;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header REMOTE-HOST $remote_addr;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+
+    # 处理 login 端点
+    if ($request_uri ~* "login") {
+        access_by_lua '
+            local cjson = require "cjson"
+            ngx.header.content_type = "application/json";
+            local file_path = "/www/wwwroot/你的域名/db.json"
+            local file, err = io.open(file_path, "r")
+            
+            if not file then
+                ngx.log(ngx.ERR, "文件打开失败: ", err)
+                ngx.exit(ngx.HTTP_INTERNAL_SERVER_ERROR)
+            end
+            
+            local content = file:read("*a")
+            file:close()
+            local ok, data = pcall(cjson.decode, content)
+            
+            if not ok or type(data) ~= "table" then
+                ngx.log(ngx.ERR, "JSON解析失败")
+                ngx.exit(ngx.HTTP_INTERNAL_SERVER_ERROR)
+            end
+            
+            if not data.user or not data.session then
+                ngx.log(ngx.ERR, "用户数据不完整")
+                ngx.exit(ngx.HTTP_INTERNAL_SERVER_ERROR)
+            end
+            
+            ngx.say(cjson.encode({
+                authinfo = { user = data.user },
+                session = data.session,
+                resource_list = {},
+                external_links = {}
+            }))
+            ngx.exit(ngx.HTTP_OK)
+        ';
+    }
+
+    add_header X-Cache $upstream_cache_status;
+    add_header Strict-Transport-Security "max-age=31536000";
+    add_header Cache-Control no-cache;
+    sub_filter_types application/json;
+    proxy_set_header Accept-Encoding "";
+    sub_filter_once off;
+}
